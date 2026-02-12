@@ -1,8 +1,7 @@
 //! StatusBlock: Live status snapshot for channels.
 
-use crate::{BranchId, ProcessEvent, WorkerId};
+use crate::{BranchId, ProcessEvent, ProcessId, WorkerId};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 
 /// Live status block injected into channel context.
 #[derive(Debug, Clone, Default)]
@@ -31,6 +30,7 @@ pub struct WorkerStatus {
     pub status: String,
     pub started_at: DateTime<Utc>,
     pub notify_on_complete: bool,
+    pub tool_calls: usize,
 }
 
 /// Recently completed work item.
@@ -88,6 +88,14 @@ impl StatusBlock {
                     }
                 }
             }
+            ProcessEvent::ToolCompleted {
+                process_id: ProcessId::Worker(worker_id),
+                ..
+            } => {
+                if let Some(worker) = self.active_workers.iter_mut().find(|w| w.id == *worker_id) {
+                    worker.tool_calls += 1;
+                }
+            }
             ProcessEvent::BranchResult {
                 branch_id,
                 conclusion,
@@ -131,6 +139,7 @@ impl StatusBlock {
             status: "starting".to_string(),
             started_at: Utc::now(),
             notify_on_complete,
+            tool_calls: 0,
         });
     }
 
@@ -142,11 +151,17 @@ impl StatusBlock {
         if !self.active_workers.is_empty() {
             output.push_str("## Active Workers\n");
             for worker in &self.active_workers {
+                let tool_calls_str = if worker.tool_calls > 0 {
+                    format!(", {} tool calls", worker.tool_calls)
+                } else {
+                    String::new()
+                };
                 output.push_str(&format!(
-                    "- [{}] {} ({}): {}\n",
+                    "- [{}] {} ({}{}): {}\n",
                     worker.id,
                     worker.task,
                     worker.started_at.format("%H:%M"),
+                    tool_calls_str,
                     worker.status
                 ));
             }
