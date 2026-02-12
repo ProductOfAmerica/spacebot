@@ -44,10 +44,15 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting spacebot");
 
-    // Load configuration
+    // Load configuration, running onboarding on first launch
     let config = if let Some(config_path) = cli.config {
         spacebot::config::Config::load_from_path(&config_path)
             .with_context(|| format!("failed to load config from {}", config_path.display()))?
+    } else if spacebot::config::Config::needs_onboarding() {
+        let config_path = spacebot::config::run_onboarding()
+            .with_context(|| "onboarding failed")?;
+        spacebot::config::Config::load_from_path(&config_path)
+            .with_context(|| "failed to load newly created configuration")?
     } else {
         spacebot::config::Config::load()
             .with_context(|| "failed to load configuration")?

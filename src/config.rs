@@ -636,15 +636,33 @@ fn resolve_routing(toml: Option<TomlRoutingConfig>, base: &RoutingConfig) -> Rou
 }
 
 impl Config {
-    /// Load configuration from the default config file, falling back to env vars.
-    pub fn load() -> Result<Self> {
-        let instance_dir = std::env::var("SPACEBOT_DIR")
+    /// Resolve the instance directory from env or default (~/.spacebot).
+    pub fn default_instance_dir() -> PathBuf {
+        std::env::var("SPACEBOT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
                 dirs::home_dir()
                     .map(|d| d.join(".spacebot"))
                     .unwrap_or_else(|| PathBuf::from("./.spacebot"))
-            });
+            })
+    }
+
+    /// Check whether a first-run onboarding is needed (no config file and no env keys).
+    pub fn needs_onboarding() -> bool {
+        let instance_dir = Self::default_instance_dir();
+        let config_path = instance_dir.join("config.toml");
+        if config_path.exists() {
+            return false;
+        }
+        // No config file — check if env vars can bootstrap
+        std::env::var("ANTHROPIC_API_KEY").is_err()
+            && std::env::var("OPENAI_API_KEY").is_err()
+            && std::env::var("OPENROUTER_API_KEY").is_err()
+    }
+
+    /// Load configuration from the default config file, falling back to env vars.
+    pub fn load() -> Result<Self> {
+        let instance_dir = Self::default_instance_dir();
 
         let config_path = instance_dir.join("config.toml");
         if config_path.exists() {
@@ -1272,4 +1290,190 @@ pub fn spawn_file_watcher(
 
         tracing::info!("file watcher stopped");
     })
+}
+
+/// Interactive first-run onboarding. Creates ~/.spacebot with a minimal config.
+///
+/// Returns the path to the newly created config file on success.
+pub fn run_onboarding() -> anyhow::Result<PathBuf> {
+    use dialoguer::{Input, Password, Select};
+    use std::io::Write;
+
+    println!();
+    println!("  Welcome to Spacebot");
+    println!("  -------------------");
+    println!();
+    println!("  No configuration found. Let's set things up.");
+    println!();
+
+    // 1. Pick a provider
+    let providers = &["Anthropic", "OpenRouter", "OpenAI"];
+    let provider_idx = Select::new()
+        .with_prompt("Which LLM provider do you want to use?")
+        .items(providers)
+        .default(0)
+        .interact()?;
+
+    let (provider_key_name, toml_key) = match provider_idx {
+        0 => ("Anthropic API key", "anthropic_key"),
+        1 => ("OpenRouter API key", "openrouter_key"),
+        2 => ("OpenAI API key", "openai_key"),
+        _ => unreachable!(),
+    };
+
+    // 2. Get API key
+    let api_key: String = Password::new()
+        .with_prompt(format!("Enter your {provider_key_name}"))
+        .interact()?;
+
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        anyhow::bail!("API key cannot be empty");
+    }
+
+    // 3. Agent name
+    let agent_id: String = Input::new()
+        .with_prompt("Agent name")
+        .default("main".to_string())
+        .interact_text()?;
+
+    let agent_id = agent_id.trim().to_lowercase().replace(' ', "-");
+
+    // 4. Optional Discord setup
+    let setup_discord = Select::new()
+        .with_prompt("Set up Discord integration?")
+        .items(&["Not now", "Yes"])
+        .default(0)
+        .interact()?;
+
+    struct DiscordSetup {
+        token: String,
+        guild_id: Option<String>,
+        channel_ids: Vec<String>,
+        dm_user_ids: Vec<String>,
+    }
+
+    let discord = if setup_discord == 1 {
+        let token: String = Password::new()
+            .with_prompt("Discord bot token")
+            .interact()?;
+        let token = token.trim().to_string();
+
+        if token.is_empty() {
+            None
+        } else {
+            println!();
+            println!("  Tip: Right-click a server or channel in Discord with");
+            println!("  Developer Mode enabled to copy IDs. Leave blank to skip.");
+            println!();
+
+            let guild_id: String = Input::new()
+                .with_prompt("Server (guild) ID")
+                .allow_empty(true)
+                .default(String::new())
+                .interact_text()?;
+            let guild_id = guild_id.trim().to_string();
+            let guild_id = if guild_id.is_empty() {
+                None
+            } else {
+                Some(guild_id)
+            };
+
+            let channel_ids_raw: String = Input::new()
+                .with_prompt("Channel IDs (comma-separated, or blank for all)")
+                .allow_empty(true)
+                .default(String::new())
+                .interact_text()?;
+            let channel_ids: Vec<String> = channel_ids_raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let dm_user_ids_raw: String = Input::new()
+                .with_prompt("User IDs allowed to DM the bot (comma-separated, or blank)")
+                .allow_empty(true)
+                .default(String::new())
+                .interact_text()?;
+            let dm_user_ids: Vec<String> = dm_user_ids_raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            Some(DiscordSetup {
+                token,
+                guild_id,
+                channel_ids,
+                dm_user_ids,
+            })
+        }
+    } else {
+        None
+    };
+
+    // 5. Build config.toml
+    let instance_dir = Config::default_instance_dir();
+    let config_path = instance_dir.join("config.toml");
+
+    // Create directory structure
+    std::fs::create_dir_all(&instance_dir)
+        .with_context(|| format!("failed to create {}", instance_dir.display()))?;
+
+    let mut config_content = String::new();
+    config_content.push_str("[llm]\n");
+    config_content.push_str(&format!("{toml_key} = \"{api_key}\"\n"));
+    config_content.push('\n');
+    config_content.push_str("[[agents]]\n");
+    config_content.push_str(&format!("id = \"{agent_id}\"\n"));
+    config_content.push_str("default = true\n");
+
+    if let Some(discord) = &discord {
+        config_content.push_str("\n[messaging.discord]\n");
+        config_content.push_str("enabled = true\n");
+        config_content.push_str(&format!("token = \"{}\"\n", discord.token));
+
+        if !discord.dm_user_ids.is_empty() {
+            let ids: Vec<String> = discord
+                .dm_user_ids
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect();
+            config_content.push_str(&format!("dm_allowed_users = [{}]\n", ids.join(", ")));
+        }
+
+        // Write the binding
+        config_content.push_str("\n[[bindings]]\n");
+        config_content.push_str(&format!("agent_id = \"{agent_id}\"\n"));
+        config_content.push_str("channel = \"discord\"\n");
+        if let Some(guild_id) = &discord.guild_id {
+            config_content.push_str(&format!("guild_id = \"{guild_id}\"\n"));
+        }
+        if !discord.channel_ids.is_empty() {
+            let ids: Vec<String> = discord
+                .channel_ids
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect();
+            config_content.push_str(&format!("channel_ids = [{}]\n", ids.join(", ")));
+        }
+    }
+
+    let mut file = std::fs::File::create(&config_path)
+        .with_context(|| format!("failed to create {}", config_path.display()))?;
+    file.write_all(config_content.as_bytes())?;
+
+    println!();
+    println!("  Config written to {}", config_path.display());
+    println!("  Agent '{}' created.", agent_id);
+    println!();
+    println!("  You can customize identity files in:");
+    println!(
+        "    {}/agents/{}/workspace/",
+        instance_dir.display(),
+        agent_id
+    );
+    println!();
+
+    Ok(config_path)
 }
